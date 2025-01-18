@@ -1,0 +1,10 @@
+streamlit
+numpy
+pandas
+matplotlib
+seaborn
+scipy
+plotly
+yfinance
+pystan==2.19.1.1
+prophet
