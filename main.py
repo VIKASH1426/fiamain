@@ -1,4 +1,5 @@
 import streamlit as st
+import pandas as pd  # Import pandas
 import pickle
 import yfinance as yf
 import numpy as np
@@ -7,8 +8,7 @@ from scipy.optimize import minimize
 import seaborn as sns
 import os
 from datetime import date
-from prophet import Prophet
-from prophet.plot import plot_plotly
+from statsmodels.tsa.arima.model import ARIMA
 from plotly import graph_objs as go
 
 # ---- File Management Setup ---- #
@@ -85,27 +85,81 @@ def show_portfolio():
     else:
         return "Your portfolio is empty."
 
-# ---- Stock Prediction Chart ---- #
+# ---- Portfolio Optimization ---- #
 @st.cache_data(ttl=3600)
-def stock_prediction_chart(ticker):
-    stock = yf.Ticker(ticker)
-    hist = stock.history(period="1mo")
-    if not hist.empty:
-        last_price = hist['Close'].iloc[-1]
-        st.line_chart(hist['Close'])
-        st.write(f"The last price of {ticker} is ${last_price:.2f}.")
-    else:
-        st.write(f"No historical data available for {ticker}.")
+def get_stock_data(tickers, period='1y'):
+    try:
+        df = yf.download(tickers, period=period)['Close']
+        return df
+    except Exception as e:
+        st.error(f"Error retrieving stock data: {e}")
+        return None
 
-# ---- Stock Forecast ---- #
+def optimize_portfolio(mean_returns, cov_matrix, risk_free_rate=0.02):
+    num_assets = len(mean_returns)
+    args = (mean_returns, cov_matrix, risk_free_rate)
+
+    # Constraints: weights sum to 1
+    constraints = ({'type': 'eq', 'fun': lambda x: np.sum(x) - 1})
+
+    # Bounds: weights between 0 and 1
+    bounds = tuple((0, 1) for _ in range(num_assets))
+
+    # Initial weights
+    initial_weights = num_assets * [1. / num_assets]
+
+    # Define the Sharpe ratio optimization function
+    def negative_sharpe_ratio(weights, mean_returns, cov_matrix, risk_free_rate):
+        portfolio_return = np.dot(weights, mean_returns)
+        portfolio_volatility = np.sqrt(np.dot(weights.T, np.dot(cov_matrix, weights)))
+        sharpe_ratio = (portfolio_return - risk_free_rate) / portfolio_volatility
+        return -sharpe_ratio  # Negative because we are minimizing
+
+    # Optimize
+    result = minimize(negative_sharpe_ratio, initial_weights, args=args, method='SLSQP', bounds=bounds, constraints=constraints)
+    return result
+
+def display_allocation_pie_chart(tickers, weights):
+    fig, ax = plt.subplots()
+    ax.pie(weights, labels=tickers, autopct='%1.1f%%', startangle=90, colors=sns.color_palette("husl", len(tickers)))
+    ax.axis('equal')
+    st.pyplot(fig)
+
+def recommend_mpt_allocation():
+    st.header("Portfolio Optimization Using Modern Portfolio Theory")
+
+    tickers = list(portfolio.keys())
+    if not tickers:
+        return st.write("Your portfolio is empty. Please add stocks to proceed with optimization.")
+
+    # Fetch stock data
+    df = get_stock_data(tickers)
+    if df is None:
+        return st.write("Error fetching stock data. Please try again later.")
+
+    returns = df.pct_change().dropna()
+    mean_returns = returns.mean()
+    cov_matrix = returns.cov()
+
+    # Optimize the portfolio
+    optimized_result = optimize_portfolio(mean_returns, cov_matrix)
+    optimized_weights = optimized_result.x
+
+    st.subheader("Optimized Portfolio Allocation")
+    display_allocation_pie_chart(tickers, optimized_weights)
+
+    st.write("### Recommended Allocation:")
+    for ticker, weight in zip(tickers, optimized_weights):
+        st.write(f"{ticker}: **{weight * 100:.2f}%**")
+
+# ---- Stock Forecast Using ARIMA ---- #
 def stock_forecast_app():
     START = "2015-01-01"
     TODAY = date.today().strftime("%Y-%m-%d")
 
     # User Input
     user_input_stock = st.text_input('Enter stock symbol:', 'AAPL')
-    n_years = st.slider('Years of prediction:', 1, 4)
-    period = n_years * 365
+    n_days = st.slider('Days of prediction:', 1, 30)
 
     @st.cache_data
     def load_data(ticker):
@@ -120,27 +174,50 @@ def stock_forecast_app():
 
     # Plot Data
     fig = go.Figure()
-    fig.add_trace(go.Scatter(x=data['Date'], y=data['Open'], name="stock_open"))
-    fig.add_trace(go.Scatter(x=data['Date'], y=data['Close'], name="stock_close"))
+    fig.add_trace(go.Scatter(x=data['Date'], y=data['Close'], name="Close Price"))
     fig.layout.update(title_text='Time Series Data', xaxis_rangeslider_visible=True)
     st.plotly_chart(fig)
 
-    # Forecast
-    df_train = data[['Date', 'Close']].rename(columns={"Date": "ds", "Close": "y"})
-    m = Prophet()
-    m.fit(df_train)
-    future = m.make_future_dataframe(periods=period)
-    forecast = m.predict(future)
+    # ARIMA Forecast
+    st.subheader(f'{user_input_stock} Price Prediction for {n_days} Days')
 
-    # Display Forecast
-    st.write(f"Forecast for {n_years} years")
-    st.plotly_chart(plot_plotly(m, forecast))
+    def arima_forecast(data, n_days):
+        close_prices = data['Close']
+        model = ARIMA(close_prices, order=(5, 1, 0))  # ARIMA parameters (p, d, q)
+        model_fit = model.fit()
+        forecast = model_fit.forecast(steps=n_days)
+        return forecast
+
+    # Predict for 30 days
+    n_days = 30
+    forecast = arima_forecast(data, n_days)
+
+    # Generate future dates for plotting
+    last_date = data['Date'].iloc[-1]
+    future_dates = [last_date + pd.Timedelta(days=i) for i in range(1, n_days + 1)]
+
+    # Prepare forecast DataFrame
+    forecast_df = pd.DataFrame({'Date': future_dates, 'Forecast': forecast})
+
+    # Plot the forecast
+    st.subheader("Forecasted Prices for the Next 30 Days")
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=data['Date'], y=data['Close'], name="Historical Prices"))
+    fig.add_trace(go.Scatter(x=forecast_df['Date'], y=forecast_df['Forecast'], name="Forecasted Prices"))
+    fig.layout.update(title_text=f'{user_input_stock} Price Prediction for 30 Days', xaxis_title="Date",
+                      yaxis_title="Price")
+    st.plotly_chart(fig)
+
+    # Display Forecast Data
+    st.write("Forecasted Prices:")
+    st.write(forecast_df)
+
 
 # ---- Main App ---- #
 def main():
     st.title("Investment Portfolio Management")
     st.sidebar.title("Navigation")
-    options = st.sidebar.radio("Select an option", ("Bank Accounts", "Stocks", "Stock Forecast"))
+    options = st.sidebar.radio("Select an option", ("Bank Accounts", "Stocks", "Portfolio Optimization", "Stock Forecast"))
 
     if options == "Bank Accounts":
         st.header("Manage Bank Accounts")
@@ -165,8 +242,12 @@ def main():
         elif action == "Show Portfolio":
             st.write(show_portfolio())
 
+    elif options == "Portfolio Optimization":
+        recommend_mpt_allocation()
+
     elif options == "Stock Forecast":
         stock_forecast_app()
 
 if __name__ == "__main__":
     main()
+
